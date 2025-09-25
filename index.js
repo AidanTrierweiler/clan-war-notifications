@@ -58,6 +58,14 @@ const clanTag = process.env.CLAN_TAG;
 const subscribersFile = './subscribers.json';
 let subscribers = [];
 
+// Add state tracking variables
+let lastWarState = null;
+let timeWarningsShown = {
+  oneHour: false,
+  thirtyMin: false,
+  fifteenMin: false
+};
+
 if (fs.existsSync(subscribersFile)) {
   subscribers = JSON.parse(fs.readFileSync(subscribersFile));
 }
@@ -155,6 +163,15 @@ async function getCurrentCWLWar() {
 
     const warData = await warRes.json();
     console.log(`✅ Successfully fetched CWL war data - Status: ${warData.state}`);
+    
+    // Temporary debugging - remove this after we see what the API returns
+    console.log('🔍 War timing data:', {
+      state: warData.state,
+      startTime: warData.startTime,
+      endTime: warData.endTime,
+      preparationStartTime: warData.preparationStartTime
+    });
+    
     return warData;
     
   } catch (err) {
@@ -164,48 +181,190 @@ async function getCurrentCWLWar() {
 }
 
 function formatWarMessage(war) {
-  const status = war.state;
-  const clan = war.clan.name;
-  const opponent = war.opponent.name;
+  const clan = war.clan;
+  const opponent = war.opponent;
+  
+  // Parse Clash of Clans custom time format
+  function parseClashTime(clashTime) {
+    if (!clashTime) return null;
+    try {
+      // Clash API format: 20250910T015830.000Z
+      const date = new Date(clashTime);
+      return isNaN(date.getTime()) ? null : date;
+    } catch (error) {
+      console.warn('⚠️ Error parsing clash time:', clashTime, error.message);
+      return null;
+    }
+  }
+  
+  const endTime = parseClashTime(war.endTime);
+  const startTime = parseClashTime(war.startTime);
+  let timeInfo = '';
+  
+  if (endTime) {
+    const now = new Date();
+    const timeRemaining = endTime - now;
+    
+    if (war.state === 'preparation' && startTime) {
+      const timeToStart = startTime - now;
+      if (timeToStart > 0) {
+        const hours = Math.floor(timeToStart / (1000 * 60 * 60));
+        const minutes = Math.floor((timeToStart % (1000 * 60 * 60)) / (1000 * 60));
+        timeInfo = `⏳ War starts in: ${hours}h ${minutes}m`;
+      }
+    } else if (war.state === 'inWar' && timeRemaining > 0) {
+      const hours = Math.floor(timeRemaining / (1000 * 60 * 60));
+      const minutes = Math.floor((timeRemaining % (1000 * 60 * 60)) / (1000 * 60));
+      timeInfo = `⏰ Time remaining: ${hours}h ${minutes}m`;
+      
+      // Add urgency indicators for final warnings
+      const totalMinutes = hours * 60 + minutes;
+      if (totalMinutes <= 15) {
+        timeInfo = `🚨 ${timeInfo} - FINAL PUSH!`;
+      } else if (totalMinutes <= 30) {
+        timeInfo = `⚠️ ${timeInfo} - Time running out!`;
+      } else if (totalMinutes <= 60) {
+        timeInfo = `🔔 ${timeInfo} - One hour left!`;
+      }
+    } else if (war.state === 'warEnded') {
+      timeInfo = `✅ War ended at: ${endTime.toLocaleString()}`;
+    }
+  }
 
-  let message = `⚔️ *CWL War Status*: ${status}\n`;
-  message += `🏰 *${clan}* vs *${opponent}*\n`;
+  let message = `⚔️ *CWL War Status*: ${war.state}\n`;
+  message += `🏰 *${clan.name}* vs *${opponent.name}*\n`;
 
-  if (status === 'inWar' || status === 'warEnded') {
-    message += `⭐ ${war.clan.stars} - ${war.opponent.stars}\n`;
-    message += `🔥 ${war.clan.destructionPercentage.toFixed(1)}% - ${war.opponent.destructionPercentage.toFixed(1)}%\n`;
-    message += `🕒 Attacks: ${war.clan.attacks || 0} / ${war.clan.members * 2}`;
+  if (war.state === 'inWar' || war.state === 'warEnded') {
+    message += `⭐ ${clan.stars} - ${opponent.stars}\n`;
+    message += `🔥 ${clan.destructionPercentage.toFixed(1)}% - ${opponent.destructionPercentage.toFixed(1)}%\n`;
+    message += `🕒 Attacks: ${clan.attacks || 0} / ${(clan.members?.length || 15) * 2}\n`;
+    
+    if (timeInfo) {
+      message += `${timeInfo}\n`;
+    }
+    
+    // Show end time if we have valid data
+    if (endTime) {
+      message += `\n📅 War ends: ${endTime.toLocaleDateString()} at ${endTime.toLocaleTimeString()}`;
+    }
+  } else if (war.state === 'preparation') {
+    if (timeInfo) {
+      message += `${timeInfo}\n`;
+    }
+    if (startTime) {
+      message += `📅 War starts: ${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString()}`;
+    }
   }
 
   return message;
 }
 
 async function sendWarUpdate() {
-  const war = await getCurrentCWLWar();
-  if (!war) {
-    console.log("⏸️  No war data available - skipping update.");
-    return;
-  }
+  try {
+    console.log('🔄 Checking for war updates...');
+    const war = await getCurrentCWLWar();
+    
+    if (!war) {
+      console.log('❌ No war data available, skipping update check');
+      return;
+    }
 
-  const message = formatWarMessage(war);
-  console.log(`📤 Sending update to ${subscribers.length} subscriber(s)`);
-  
-  for (const chatId of subscribers) {
-    try {
-      await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-    } catch (err) {
-      console.error(`❌ Failed to send message to ${chatId}:`, err.message);
-      // Consider removing invalid chat IDs
-      if (err.code === 'ETELEGRAM' && err.response?.statusCode === 403) {
-        console.log(`🚫 Removing blocked subscriber: ${chatId}`);
-        const index = subscribers.indexOf(chatId);
-        if (index > -1) {
-          subscribers.splice(index, 1);
-          saveSubscribers();
+    const shouldSendUpdate = shouldSendWarUpdate(war);
+    
+    if (shouldSendUpdate.send) {
+      console.log(`📤 Sending update to ${subscribers.length} subscriber(s) - Reason: ${shouldSendUpdate.reason}`);
+      const message = formatWarMessage(war);
+      
+      for (const chatId of subscribers) {
+        try {
+          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+        } catch (error) {
+          if (error.response && error.response.statusCode === 403) {
+            console.log(`🚫 Removing blocked subscriber: ${chatId}`);
+            subscribers = subscribers.filter(id => id !== chatId);
+            saveSubscribers();
+          } else {
+            console.error(`❌ Error sending message to ${chatId}:`, error.message);
+          }
         }
       }
+      
+      // Update last war state
+      lastWarState = {
+        clanStars: war.clan.stars,
+        opponentStars: war.opponent.stars,
+        state: war.state,
+        endTime: war.endTime
+      };
+    } else {
+      console.log('⏭️ No significant changes, skipping update');
+    }
+    
+  } catch (error) {
+    console.error('💥 Error checking for updates:', error.message);
+  }
+}
+
+// New function to determine if we should send an update
+function shouldSendWarUpdate(war) {
+  // Always send update if this is the first check
+  if (!lastWarState) {
+    return { send: true, reason: "First war check" };
+  }
+
+  // Always send if war state changed (prep -> inWar -> ended)
+  if (lastWarState.state !== war.state) {
+    // Reset time warnings when war state changes
+    timeWarningsShown = { oneHour: false, thirtyMin: false, fifteenMin: false };
+    return { send: true, reason: `War state changed to ${war.state}` };
+  }
+
+  // Send if stars changed
+  const starsChanged = (
+    lastWarState.clanStars !== war.clan.stars || 
+    lastWarState.opponentStars !== war.opponent.stars
+  );
+  
+  if (starsChanged) {
+    return { 
+      send: true, 
+      reason: `Stars changed: ${lastWarState.clanStars}-${lastWarState.opponentStars} → ${war.clan.stars}-${war.opponent.stars}` 
+    };
+  }
+
+  // Check for time-based warnings (only during active war)
+  if (war.state === 'inWar') {
+    try {
+      const endTime = new Date(war.endTime);
+      if (!isNaN(endTime.getTime())) {
+        const now = new Date();
+        const timeRemaining = endTime - now;
+        const minutesRemaining = Math.floor(timeRemaining / (1000 * 60));
+
+        // 1 hour warning (60 minutes)
+        if (minutesRemaining <= 60 && minutesRemaining > 45 && !timeWarningsShown.oneHour) {
+          timeWarningsShown.oneHour = true;
+          return { send: true, reason: "1 hour remaining warning" };
+        }
+
+        // 30 minute warning
+        if (minutesRemaining <= 30 && minutesRemaining > 20 && !timeWarningsShown.thirtyMin) {
+          timeWarningsShown.thirtyMin = true;
+          return { send: true, reason: "30 minutes remaining warning" };
+        }
+
+        // 15 minute warning
+        if (minutesRemaining <= 15 && minutesRemaining > 5 && !timeWarningsShown.fifteenMin) {
+          timeWarningsShown.fifteenMin = true;
+          return { send: true, reason: "15 minutes remaining warning" };
+        }
+      }
+    } catch (error) {
+      console.warn('⚠️ Error parsing endTime for warnings:', error.message);
     }
   }
+
+  return { send: false, reason: "No significant changes" };
 }
 
 // Every 10 minutes
