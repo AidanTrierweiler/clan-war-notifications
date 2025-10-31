@@ -1,0 +1,11 @@
+# Ignore environment variables
+.env
+
+# Ignore Python virtual environments (in case you add one later)
+venv/
+
+# Ignore OS-specific files
+.DS_Store
+
+# Ignore JSON output files (optional, for local-only data)
+currentwar.json

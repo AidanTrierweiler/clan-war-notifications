@@ -1,27 +1,27 @@
 /*
  * Clash of Clans CWL War Notification Bot
  * 
- * 📊 Project Overview:
+ * Project Overview:
  * This Node.js bot fetches Clash of Clans Clan War League (CWL) war info using the 
  * official Clash of Clans API and sends periodic updates via Telegram.
  * 
- * 🎯 Features:
+ * Features:
  * - Automatically runs every 10 minutes
  * - Works specifically with CWL wars (not regular wars)
  * - Only sends messages to subscribed users (/start command)
  * - Runs locally with environment variables from .env file
  * 
- * 🔧 Dependencies:
+ * Dependencies:
  * - node-fetch: HTTP requests to Clash of Clans API
  * - node-telegram-bot-api: Telegram Bot interactions
  * - dotenv: Load secrets from .env file
  * - fs: Store subscribers in local JSON file
  * 
- * 📡 API Endpoints:
+ * API Endpoints:
  * - CWL Group: GET /v1/clans/{clanTag}/currentwar/leaguegroup
  * - CWL War: GET /v1/clanwarleagues/wars/{warTag}
  * 
- * 🛠️ Environment Variables Required:
+ * Environment Variables Required:
  * - TELEGRAM_BOT_TOKEN: Your Telegram bot token
  * - CLASH_API_TOKEN: Your Clash of Clans API token
  * - CLAN_TAG: Your clan tag (with or without #)
