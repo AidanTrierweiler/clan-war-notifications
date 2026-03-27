@@ -56,12 +56,64 @@ function freshState() {
     prepNotified: false,
     startNotified: false,
     endNotified: false,
-    seenAttacks: new Set(),      // tracks "attackerTag:order" keys
+    seenAttacks: new Set(),
     timeWarnings: { 60: false, 30: false, 15: false },
   };
 }
 
 let state = freshState();
+
+// --- Upstash Redis state persistence ---
+// Uses the REST API directly (no extra package needed)
+const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY     = `coc-war-state-${(process.env.CLAN_TAG || '').replace('#', '')}`;
+
+async function saveState() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    const payload = {
+      warState:      state.warState,
+      warId:         state.warId,
+      prepNotified:  state.prepNotified,
+      startNotified: state.startNotified,
+      endNotified:   state.endNotified,
+      seenAttacks:   [...state.seenAttacks],
+      timeWarnings:  state.timeWarnings,
+    };
+    await fetch(`${UPSTASH_URL}/set/${STATE_KEY}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(JSON.stringify(payload)),
+    });
+  } catch (err) {
+    console.error('[State] Failed to save:', err.message);
+  }
+}
+
+async function loadState() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  try {
+    const res  = await fetch(`${UPSTASH_URL}/get/${STATE_KEY}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    const data = await res.json();
+    if (!data.result) return;
+    const saved = JSON.parse(data.result);
+    state = {
+      warState:      saved.warState      ?? null,
+      warId:         saved.warId         ?? null,
+      prepNotified:  saved.prepNotified  ?? false,
+      startNotified: saved.startNotified ?? false,
+      endNotified:   saved.endNotified   ?? false,
+      seenAttacks:   new Set(saved.seenAttacks || []),
+      timeWarnings:  saved.timeWarnings  ?? { 60: false, 30: false, 15: false },
+    };
+    console.log(`[State] Restored — warId: ${state.warId}, attacks seen: ${state.seenAttacks.size}`);
+  } catch (err) {
+    console.error('[State] Failed to load:', err.message);
+  }
+}
 
 // --- Clash API ---
 async function apiGet(path) {
@@ -275,6 +327,7 @@ async function poll() {
   }
 
   state.warState = warState;
+  await saveState();
   console.log(
     `[${new Date().toISOString()}] ${warState}${warLabel} | ` +
     `${clanName} ${clanStars}* vs ${oppStars}* ${oppName} | ` +
@@ -331,7 +384,7 @@ async function main() {
   console.log(`[Start] Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log(`[Start] Telegram chat ID: ${TELEGRAM_CHAT_ID}`);
 
-  await sendSMS('CoC War Bot is online! You will receive war notifications here.');
+  await loadState();
 
   if (process.argv.includes('--test')) {
     await runTest();
