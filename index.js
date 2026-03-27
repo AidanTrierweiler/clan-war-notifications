@@ -1,378 +1,351 @@
 /*
- * Clash of Clans CWL War Notification Bot
- * 
- * Project Overview:
- * This Node.js bot fetches Clash of Clans Clan War League (CWL) war info using the 
- * official Clash of Clans API and sends periodic updates via Telegram.
- * 
- * Features:
- * - Automatically runs every 10 minutes
- * - Works specifically with CWL wars (not regular wars)
- * - Only sends messages to subscribed users (/start command)
- * - Runs locally with environment variables from .env file
- * 
- * Dependencies:
- * - node-fetch: HTTP requests to Clash of Clans API
- * - node-telegram-bot-api: Telegram Bot interactions
- * - dotenv: Load secrets from .env file
- * - fs: Store subscribers in local JSON file
- * 
- * API Endpoints:
- * - CWL Group: GET /v1/clans/{clanTag}/currentwar/leaguegroup
- * - CWL War: GET /v1/clanwarleagues/wars/{warTag}
- * 
- * Environment Variables Required:
- * - TELEGRAM_BOT_TOKEN: Your Telegram bot token
- * - CLASH_API_TOKEN: Your Clash of Clans API token
- * - CLAN_TAG: Your clan tag (with or without #)
+ * Clash of Clans War Notification System
+ *
+ * Sends FREE notifications via Telegram bot.
+ * Supports both regular wars and Clan War League (CWL) wars.
+ *
+ * Notifications sent:
+ *   - War declared (preparation phase)
+ *   - War started (battle day begins)
+ *   - Every attack your clan makes
+ *   - Every attack the enemy clan makes
+ *   - Time warnings (60, 30, 15 min remaining)
+ *   - War ended with final result (win/loss/tie)
+ *
+ * Environment Variables Required (.env):
+ *   CLAN_TAG           - Your clan tag, e.g. #ABC123
+ *   CLASH_API_TOKEN    - Token from https://developer.clashofclans.com
+ *   TELEGRAM_BOT_TOKEN - Token from @BotFather on Telegram
+ *   TELEGRAM_CHAT_ID   - Your chat ID (see setup instructions)
  */
 
-const TelegramBot = require('node-telegram-bot-api');
-const dotenv = require('dotenv');
+require('dotenv').config();
 const fetch = require('node-fetch');
-const fs = require('fs');
+const http  = require('http');
 
-// Load environment variables
-dotenv.config();
+// --- Config ---
+const CLAN_TAG_RAW       = (process.env.CLAN_TAG || '').trim();
+const CLAN_TAG_ENCODED   = encodeURIComponent(CLAN_TAG_RAW);
+const CLASH_API_TOKEN    = process.env.CLASH_API_TOKEN;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
+const POLL_INTERVAL_MS   = parseInt(process.env.POLL_INTERVAL_MS || '120000');
 
-// Validate required environment variables
-const requiredEnvVars = ['TELEGRAM_BOT_TOKEN', 'CLASH_API_TOKEN', 'CLAN_TAG'];
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
-
-if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars.join(', '));
-  console.error('Please check your .env file and ensure all required variables are set.');
-  process.exit(1);
-}
-
-// Log loaded environment variables (excluding sensitive tokens)
-console.log('✅ Environment variables loaded:');
-console.log(`CLAN_TAG: ${process.env.CLAN_TAG}`);
-console.log(`TELEGRAM_BOT_TOKEN: ${process.env.TELEGRAM_BOT_TOKEN ? '[SET]' : '[MISSING]'}`);
-console.log(`CLASH_API_TOKEN: ${process.env.CLASH_API_TOKEN ? '[SET]' : '[MISSING]'}`);
-
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const clashApiToken = process.env.CLASH_API_TOKEN;
-const clanTag = process.env.CLAN_TAG;
-
-const subscribersFile = './subscribers.json';
-let subscribers = [];
-
-// Add state tracking variables
-let lastWarState = null;
-let timeWarningsShown = {
-  oneHour: false,
-  thirtyMin: false,
-  fifteenMin: false
-};
-
-if (fs.existsSync(subscribersFile)) {
-  subscribers = JSON.parse(fs.readFileSync(subscribersFile));
-}
-
-function saveSubscribers() {
-  fs.writeFileSync(subscribersFile, JSON.stringify(subscribers, null, 2));
-}
-
-bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  if (!subscribers.includes(chatId)) {
-    subscribers.push(chatId);
-    saveSubscribers();
-    bot.sendMessage(chatId, '🎉 You have been subscribed to CWL war notifications!');
-    console.log(`📱 New subscriber added: ${chatId}`);
-  } else {
-    bot.sendMessage(chatId, '✅ You are already subscribed to war notifications.');
-  }
-});
-
-bot.onText(/\/stop/, (msg) => {
-  const chatId = msg.chat.id;
-  const index = subscribers.indexOf(chatId);
-  if (index > -1) {
-    subscribers.splice(index, 1);
-    saveSubscribers();
-    bot.sendMessage(chatId, '👋 You have been unsubscribed from war notifications.');
-    console.log(`📱 Subscriber removed: ${chatId}`);
-  } else {
-    bot.sendMessage(chatId, '❌ You are not currently subscribed.');
-  }
-});
-
-bot.onText(/\/status/, async (msg) => {
-  const chatId = msg.chat.id;
-  const war = await getCurrentCWLWar();
-  if (war) {
-    const message = formatWarMessage(war);
-    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-  } else {
-    bot.sendMessage(chatId, '❌ No CWL war data available at the moment.');
-  }
-});
-
-async function getCurrentCWLWar() {
+// --- Notification helper ---
+async function sendSMS(message) {
+  console.log(`[NOTIFY] ${message}`);
   try {
-    console.log(`🔍 Fetching CWL data for clan: ${clanTag}`);
-    
-    const encodedTag = encodeURIComponent(clanTag);
-    const groupRes = await fetch(`https://api.clashofclans.com/v1/clans/${encodedTag}/currentwar/leaguegroup`, {
-      headers: {
-        Authorization: `Bearer ${clashApiToken}`
-      }
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message }),
     });
-
-    if (!groupRes.ok) {
-      const errorData = await groupRes.json();
-      console.error(`❌ Error fetching CWL group (${groupRes.status}):`, errorData.message || groupRes.statusText);
-      
-      if (groupRes.status === 404) {
-        console.log("🔍 Clan is not currently in a CWL war.");
-      }
-      return null;
-    }
-
-    const groupData = await groupRes.json();
-
-    if (!groupData.rounds) {
-      console.log("⚠️  No CWL rounds found - clan may not be in an active CWL season.");
-      return null;
-    }
-
-    // Try to get the most recent war tag (e.g. Day 7 of CWL)
-    const latestWarTag = groupData.rounds.flatMap(r => r.warTags).reverse().find(tag => tag !== '#0');
-
-    if (!latestWarTag) {
-      console.log("❌ No valid CWL war tags found in rounds.");
-      return null;
-    }
-
-    console.log(`🎯 Fetching war details for: ${latestWarTag}`);
-    
-    const encodedWarTag = encodeURIComponent(latestWarTag);
-    const warRes = await fetch(`https://api.clashofclans.com/v1/clanwarleagues/wars/${encodedWarTag}`, {
-      headers: {
-        Authorization: `Bearer ${clashApiToken}`
-      }
-    });
-
-    if (!warRes.ok) {
-      const err = await warRes.json();
-      console.error(`❌ Error fetching CWL war (${warRes.status}):`, err.message || warRes.statusText);
-      return null;
-    }
-
-    const warData = await warRes.json();
-    console.log(`✅ Successfully fetched CWL war data - Status: ${warData.state}`);
-    
-    // Temporary debugging - remove this after we see what the API returns
-    console.log('🔍 War timing data:', {
-      state: warData.state,
-      startTime: warData.startTime,
-      endTime: warData.endTime,
-      preparationStartTime: warData.preparationStartTime
-    });
-    
-    return warData;
-    
+    const data = await res.json();
+    if (!data.ok) console.error('[NOTIFY] Telegram error:', data.description);
   } catch (err) {
-    console.error('💥 Unexpected error fetching CWL war data:', err.message);
-    return null;
+    console.error('[NOTIFY] Failed to send:', err.message);
   }
 }
 
-function formatWarMessage(war) {
-  const clan = war.clan;
-  const opponent = war.opponent;
-  
-  // Parse Clash of Clans custom time format
-  function parseClashTime(clashTime) {
-    if (!clashTime) return null;
-    try {
-      // Clash API format: 20250910T015830.000Z
-      const date = new Date(clashTime);
-      return isNaN(date.getTime()) ? null : date;
-    } catch (error) {
-      console.warn('⚠️ Error parsing clash time:', clashTime, error.message);
-      return null;
-    }
-  }
-  
-  const endTime = parseClashTime(war.endTime);
-  const startTime = parseClashTime(war.startTime);
-  let timeInfo = '';
-  
-  if (endTime) {
-    const now = new Date();
-    const timeRemaining = endTime - now;
-    
-    if (war.state === 'preparation' && startTime) {
-      const timeToStart = startTime - now;
-      if (timeToStart > 0) {
-        const hours = Math.floor(timeToStart / (1000 * 60 * 60));
-        const minutes = Math.floor((timeToStart % (1000 * 60 * 60)) / (1000 * 60));
-        timeInfo = `⏳ War starts in: ${hours}h ${minutes}m`;
-      }
-    } else if (war.state === 'inWar' && timeRemaining > 0) {
-      const hours = Math.floor(timeRemaining / (1000 * 60 * 60));
-      const minutes = Math.floor((timeRemaining % (1000 * 60 * 60)) / (1000 * 60));
-      timeInfo = `⏰ Time remaining: ${hours}h ${minutes}m`;
-      
-      // Add urgency indicators for final warnings
-      const totalMinutes = hours * 60 + minutes;
-      if (totalMinutes <= 15) {
-        timeInfo = `🚨 ${timeInfo} - FINAL PUSH!`;
-      } else if (totalMinutes <= 30) {
-        timeInfo = `⚠️ ${timeInfo} - Time running out!`;
-      } else if (totalMinutes <= 60) {
-        timeInfo = `🔔 ${timeInfo} - One hour left!`;
-      }
-    } else if (war.state === 'warEnded') {
-      timeInfo = `✅ War ended at: ${endTime.toLocaleString()}`;
-    }
-  }
-
-  let message = `⚔️ *CWL War Status*: ${war.state}\n`;
-  message += `🏰 *${clan.name}* vs *${opponent.name}*\n`;
-
-  if (war.state === 'inWar' || war.state === 'warEnded') {
-    message += `⭐ ${clan.stars} - ${opponent.stars}\n`;
-    message += `🔥 ${clan.destructionPercentage.toFixed(1)}% - ${opponent.destructionPercentage.toFixed(1)}%\n`;
-    message += `🕒 Attacks: ${clan.attacks || 0} / ${(clan.members?.length || 15) * 2}\n`;
-    
-    if (timeInfo) {
-      message += `${timeInfo}\n`;
-    }
-    
-    // Show end time if we have valid data
-    if (endTime) {
-      message += `\n📅 War ends: ${endTime.toLocaleDateString()} at ${endTime.toLocaleTimeString()}`;
-    }
-  } else if (war.state === 'preparation') {
-    if (timeInfo) {
-      message += `${timeInfo}\n`;
-    }
-    if (startTime) {
-      message += `📅 War starts: ${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString()}`;
-    }
-  }
-
-  return message;
+// --- State ---
+function freshState() {
+  return {
+    warState: null,
+    warId: null,
+    prepNotified: false,
+    startNotified: false,
+    endNotified: false,
+    seenAttacks: new Set(),      // tracks "attackerTag:order" keys
+    timeWarnings: { 60: false, 30: false, 15: false },
+  };
 }
 
-async function sendWarUpdate() {
+let state = freshState();
+
+// --- Clash API ---
+async function apiGet(path) {
+  const res = await fetch(`https://api.clashofclans.com/v1${path}`, {
+    headers: { Authorization: `Bearer ${CLASH_API_TOKEN}` },
+  });
+  const data = await res.json().catch(() => null);
+  return { status: res.status, data };
+}
+
+// Returns { war, isCWL } - tries regular war first, then CWL fallback
+async function getCurrentWar() {
+  // 1. Try regular war endpoint
+  const { status, data } = await apiGet(`/clans/${CLAN_TAG_ENCODED}/currentwar`);
+
+  if (status === 200 && data && data.state && data.state !== 'notInWar') {
+    return { war: data, isCWL: false };
+  }
+
+  // 2. Fallback: check CWL league group
+  const league = await apiGet(`/clans/${CLAN_TAG_ENCODED}/currentwar/leaguegroup`);
+  if (league.status !== 200 || !league.data || !league.data.rounds) {
+    // No regular war and no CWL
+    return { war: { state: 'notInWar' }, isCWL: false };
+  }
+
+  const rounds = league.data.rounds || [];
+
+  // Search rounds from newest to oldest for an active or ended war
+  for (let priority = 0; priority < 2; priority++) {
+    const wantedStates = priority === 0
+      ? ['inWar', 'preparation']
+      : ['warEnded'];
+
+    for (let i = rounds.length - 1; i >= 0; i--) {
+      for (const warTag of (rounds[i].warTags || [])) {
+        if (warTag === '#0') continue;
+        const { status: ws, data: wd } = await apiGet(`/clanwarleagues/wars/${encodeURIComponent(warTag)}`);
+        if (ws !== 200 || !wd) continue;
+        // Check if our clan is in this matchup
+        const ourClanInWar = wd.clan?.tag === CLAN_TAG_RAW || wd.opponent?.tag === CLAN_TAG_RAW;
+        if (ourClanInWar && wantedStates.includes(wd.state)) {
+          return { war: wd, isCWL: true };
+        }
+      }
+    }
+  }
+
+  return { war: { state: 'notInWar' }, isCWL: false };
+}
+
+// --- Utility ---
+function minsRemaining(endTime) {
+  if (!endTime) return null;
+  const end = new Date(endTime);
+  if (isNaN(end.getTime())) return null;
+  return Math.floor((end - Date.now()) / 60000);
+}
+
+function starsStr(n) {
+  const s = Math.max(0, Math.min(3, n || 0));
+  return '\u2B50'.repeat(s) + '\u2606'.repeat(3 - s);
+}
+
+function warId(war) {
+  return war.preparationStartTime || war.startTime || '';
+}
+
+// Ensure myClan is always our clan, theirClan is the opponent
+function normalizeSides(war, isCWL) {
+  if (!isCWL || war.clan?.tag === CLAN_TAG_RAW) {
+    return { myClan: war.clan, theirClan: war.opponent };
+  }
+  return { myClan: war.opponent, theirClan: war.clan };
+}
+
+// --- Main poll logic ---
+async function poll() {
+  let war, isCWL;
   try {
-    console.log('🔄 Checking for war updates...');
-    const war = await getCurrentCWLWar();
-    
-    if (!war) {
-      console.log('❌ No war data available, skipping update check');
-      return;
-    }
+    ({ war, isCWL } = await getCurrentWar());
+  } catch (err) {
+    console.error('[API] Error:', err.message);
+    return;
+  }
 
-    const shouldSendUpdate = shouldSendWarUpdate(war);
-    
-    if (shouldSendUpdate.send) {
-      console.log(`📤 Sending update to ${subscribers.length} subscriber(s) - Reason: ${shouldSendUpdate.reason}`);
-      const message = formatWarMessage(war);
-      
-      for (const chatId of subscribers) {
-        try {
-          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-        } catch (error) {
-          if (error.response && error.response.statusCode === 403) {
-            console.log(`🚫 Removing blocked subscriber: ${chatId}`);
-            subscribers = subscribers.filter(id => id !== chatId);
-            saveSubscribers();
-          } else {
-            console.error(`❌ Error sending message to ${chatId}:`, error.message);
-          }
+  if (!war || war.state === 'notInWar') {
+    if (state.warState && state.warState !== 'notInWar') {
+      console.log('[War] No active war - resetting state');
+      state = freshState();
+      state.warState = 'notInWar';
+    }
+    return;
+  }
+
+  const { myClan, theirClan } = normalizeSides(war, isCWL);
+  const warLabel = isCWL ? ' (CWL)' : '';
+  const clanName = myClan?.name || 'Your Clan';
+  const oppName  = theirClan?.name || 'Enemy';
+  const clanStars = myClan?.stars || 0;
+  const oppStars  = theirClan?.stars || 0;
+  const { state: warState, endTime, teamSize } = war;
+
+  // Detect war transition (new war started)
+  const wid = warId(war);
+  if (state.warId && state.warId !== wid) {
+    console.log('[War] New war detected - resetting state');
+    state = freshState();
+  }
+  state.warId = wid;
+
+  // --- PREPARATION PHASE ---
+  if (warState === 'preparation' && !state.prepNotified) {
+    state.prepNotified = true;
+    await sendSMS(
+      `WAR DECLARED${warLabel}!\n` +
+      `${clanName} vs ${oppName}\n` +
+      `${teamSize || '?'}v${teamSize || '?'} war\n` +
+      `Battle day starts soon!`
+    );
+  }
+
+  // --- WAR STARTED ---
+  if (warState === 'inWar' && !state.startNotified) {
+    state.startNotified = true;
+    const mins = minsRemaining(endTime);
+    const timeLeft = mins != null ? `${Math.floor(mins / 60)}h ${mins % 60}m left` : '';
+    await sendSMS(
+      `WAR STARTED${warLabel}!\n` +
+      `${clanName} ${clanStars}* vs ${oppStars}* ${oppName}\n` +
+      `${timeLeft}`
+    );
+  }
+
+  // --- TIME WARNINGS ---
+  if (warState === 'inWar' && endTime) {
+    const mins = minsRemaining(endTime);
+    if (mins != null) {
+      for (const threshold of [60, 30, 15]) {
+        if (!state.timeWarnings[threshold] && mins <= threshold && mins > threshold - 4) {
+          state.timeWarnings[threshold] = true;
+          await sendSMS(
+            `${threshold} MIN LEFT!\n` +
+            `${clanName} ${clanStars}* vs ${oppStars}* ${oppName}`
+          );
         }
       }
-      
-      // Update last war state
-      lastWarState = {
-        clanStars: war.clan.stars,
-        opponentStars: war.opponent.stars,
-        state: war.state,
-        endTime: war.endTime
-      };
-    } else {
-      console.log('⏭️ No significant changes, skipping update');
     }
-    
-  } catch (error) {
-    console.error('💥 Error checking for updates:', error.message);
-  }
-}
-
-// New function to determine if we should send an update
-function shouldSendWarUpdate(war) {
-  // Always send update if this is the first check
-  if (!lastWarState) {
-    return { send: true, reason: "First war check" };
   }
 
-  // Always send if war state changed (prep -> inWar -> ended)
-  if (lastWarState.state !== war.state) {
-    // Reset time warnings when war state changes
-    timeWarningsShown = { oneHour: false, thirtyMin: false, fifteenMin: false };
-    return { send: true, reason: `War state changed to ${war.state}` };
+  // --- ATTACK NOTIFICATIONS ---
+  if (warState === 'inWar') {
+    const myMap    = {};
+    const theirMap = {};
+    (myClan?.members    || []).forEach(m => { myMap[m.tag]    = m; });
+    (theirClan?.members || []).forEach(m => { theirMap[m.tag] = m; });
+
+    // Our clan's attacks
+    for (const member of (myClan?.members || [])) {
+      for (const attack of (member.attacks || [])) {
+        const key = `${attack.attackerTag}:${attack.order}`;
+        if (!state.seenAttacks.has(key)) {
+          state.seenAttacks.add(key);
+          const defName = theirMap[attack.defenderTag]?.name || '?';
+          const pct = (attack.destructionPercentage || 0).toFixed(1);
+          await sendSMS(
+            `YOUR CLAN attacked!\n` +
+            `${member.name} -> ${defName}\n` +
+            `${starsStr(attack.stars)} ${pct}%`
+          );
+        }
+      }
+    }
+
+    // Enemy clan's attacks
+    for (const member of (theirClan?.members || [])) {
+      for (const attack of (member.attacks || [])) {
+        const key = `${attack.attackerTag}:${attack.order}`;
+        if (!state.seenAttacks.has(key)) {
+          state.seenAttacks.add(key);
+          const defName = myMap[attack.defenderTag]?.name || '?';
+          const pct = (attack.destructionPercentage || 0).toFixed(1);
+          await sendSMS(
+            `ENEMY attacked!\n` +
+            `${member.name} -> ${defName}\n` +
+            `${starsStr(attack.stars)} ${pct}%`
+          );
+        }
+      }
+    }
   }
 
-  // Send if stars changed
-  const starsChanged = (
-    lastWarState.clanStars !== war.clan.stars || 
-    lastWarState.opponentStars !== war.opponent.stars
+  // --- WAR ENDED ---
+  if (warState === 'warEnded' && !state.endNotified) {
+    state.endNotified = true;
+    const clanDest = (myClan?.destructionPercentage || 0).toFixed(1);
+    const oppDest  = (theirClan?.destructionPercentage || 0).toFixed(1);
+
+    let result;
+    if (clanStars > oppStars) result = 'YOU WIN!';
+    else if (clanStars < oppStars) result = 'YOU LOST';
+    else if (parseFloat(clanDest) > parseFloat(oppDest)) result = 'YOU WIN!';
+    else if (parseFloat(clanDest) < parseFloat(oppDest)) result = 'YOU LOST';
+    else result = 'TIE!';
+
+    await sendSMS(
+      `WAR OVER - ${result}\n` +
+      `${clanName}: ${clanStars}* ${clanDest}%\n` +
+      `${oppName}: ${oppStars}* ${oppDest}%`
+    );
+  }
+
+  state.warState = warState;
+  console.log(
+    `[${new Date().toISOString()}] ${warState}${warLabel} | ` +
+    `${clanName} ${clanStars}* vs ${oppStars}* ${oppName} | ` +
+    `attacks seen: ${state.seenAttacks.size}`
   );
-  
-  if (starsChanged) {
-    return { 
-      send: true, 
-      reason: `Stars changed: ${lastWarState.clanStars}-${lastWarState.opponentStars} → ${war.clan.stars}-${war.opponent.stars}` 
-    };
-  }
-
-  // Check for time-based warnings (only during active war)
-  if (war.state === 'inWar') {
-    try {
-      const endTime = new Date(war.endTime);
-      if (!isNaN(endTime.getTime())) {
-        const now = new Date();
-        const timeRemaining = endTime - now;
-        const minutesRemaining = Math.floor(timeRemaining / (1000 * 60));
-
-        // 1 hour warning (60 minutes)
-        if (minutesRemaining <= 60 && minutesRemaining > 45 && !timeWarningsShown.oneHour) {
-          timeWarningsShown.oneHour = true;
-          return { send: true, reason: "1 hour remaining warning" };
-        }
-
-        // 30 minute warning
-        if (minutesRemaining <= 30 && minutesRemaining > 20 && !timeWarningsShown.thirtyMin) {
-          timeWarningsShown.thirtyMin = true;
-          return { send: true, reason: "30 minutes remaining warning" };
-        }
-
-        // 15 minute warning
-        if (minutesRemaining <= 15 && minutesRemaining > 5 && !timeWarningsShown.fifteenMin) {
-          timeWarningsShown.fifteenMin = true;
-          return { send: true, reason: "15 minutes remaining warning" };
-        }
-      }
-    } catch (error) {
-      console.warn('⚠️ Error parsing endTime for warnings:', error.message);
-    }
-  }
-
-  return { send: false, reason: "No significant changes" };
 }
 
-// Every 10 minutes
-setInterval(sendWarUpdate, 10 * 60 * 1000);
+// --- Test sequence ---
+async function runTest() {
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+  console.log('[Test] Sending sample notifications...');
 
-console.log('🚀 Bot started successfully!');
-console.log('📅 Checking for CWL war updates every 10 minutes...');
-console.log('💬 Use /start to subscribe, /stop to unsubscribe, /status for current war status');
+  await sendSMS('WAR DECLARED!\nTrierweiler vs Dragon Lords\n15v15 war\nBattle day starts soon!');
+  await delay(2000);
 
-// Initial run
-sendWarUpdate();
+  await sendSMS('WAR STARTED!\nTrierweiler 0* vs 0* Dragon Lords\n23h 59m left');
+  await delay(2000);
+
+  await sendSMS('YOUR CLAN attacked!\nAidan -> DragonKing\n⭐⭐⭐ 100.0%');
+  await delay(2000);
+
+  await sendSMS('ENEMY attacked!\nBlazeFury -> CocWarrior\n⭐⭐☆ 78.4%');
+  await delay(2000);
+
+  await sendSMS('YOUR CLAN attacked!\nCooper -> IronShield\n⭐⭐☆ 65.2%');
+  await delay(2000);
+
+  await sendSMS('60 MIN LEFT!\nTrierweiler 45* vs 38* Dragon Lords');
+  await delay(2000);
+
+  await sendSMS('30 MIN LEFT!\nTrierweiler 72* vs 61* Dragon Lords');
+  await delay(2000);
+
+  await sendSMS('15 MIN LEFT!\nTrierweiler 80* vs 77* Dragon Lords');
+  await delay(2000);
+
+  await sendSMS('WAR OVER - YOU WIN!\nTrierweiler: 88* 99.7%\nDragon Lords: 77* 87.8%');
+
+  console.log('[Test] Done. Starting normal polling...');
+}
+
+// --- Startup ---
+async function main() {
+  const missing = ['CLAN_TAG', 'CLASH_API_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    .filter(k => !process.env[k]);
+
+  if (missing.length) {
+    console.error('Missing required env vars:', missing.join(', '));
+    console.error('Copy .env.example to .env and fill in the values.');
+    process.exit(1);
+  }
+
+  console.log(`[Start] Clan: ${CLAN_TAG_RAW}`);
+  console.log(`[Start] Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`[Start] Telegram chat ID: ${TELEGRAM_CHAT_ID}`);
+
+  await sendSMS('CoC War Bot is online! You will receive war notifications here.');
+
+  if (process.argv.includes('--test')) {
+    await runTest();
+  }
+
+  // Keep-alive HTTP server so Render doesn't spin us down
+  // UptimeRobot pings this endpoint every 5 minutes for free
+  const PORT = process.env.PORT || 3000;
+  http.createServer((req, res) => res.end('ok')).listen(PORT, () => {
+    console.log(`[Keep-alive] Listening on port ${PORT}`);
+  });
+
+  await poll();
+  setInterval(poll, POLL_INTERVAL_MS);
+}
+
+main().catch(console.error);
